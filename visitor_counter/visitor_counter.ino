@@ -49,9 +49,20 @@
     RFID reader (MFRC522) is also on the Glyph -- see the ESP32 sketch for wiring.
 
     RPCs exposed to the Python brick:
-      on_encoder(int direction)  -- +1 for CW detent, -1 for CCW
-      on_button()                -- one press of the encoder push-button
+      on_button()                -- one press of the encoder push-button (toggles mode)
+      on_count(int value)        -- current absolute encoder position from the Glyph
       on_rfid(String uid)        -- one card scan, uid is a hex string
+
+  Admin mode:
+    In NORMAL mode the 7-seg shows the current occupancy.
+    Press the encoder button -> enter ADMIN mode.
+      The display switches to showing the threshold. As the operator turns
+      the encoder, the ESP32's `count` field updates and we display it as
+      the new threshold.
+    Press the encoder button again -> exit ADMIN mode.
+      The threshold is saved as the last value that came in via on_count()
+      while in admin mode.
+    All admin activity is logged on the Serial Monitor tagged [ADMIN].
 
     See esp32_encoder_bridge.ino for the ESP32-C6 sketch.
 
@@ -104,25 +115,22 @@ const int BUZZER_PIN  = 12;     // active buzzer
 
 const int MIN_CAPACITY = 1;
 const int MAX_CAPACITY = 9;     // single-digit display can only show up to 9
-const unsigned long MENU_TIMEOUT_MS = 8000;  // auto-exit menu after inactivity
+const unsigned long ADMIN_TIMEOUT_MS = 10000;  // auto-save & exit after inactivity
 
-// Letters used on the 7-seg display for menu items (segments a..g)
-const byte LETTER_C[7] = {1,0,0,1,1,1,0};   // C = Capacity
-const byte LETTER_r[7] = {0,0,0,0,1,0,1};   // r = reset
-const byte LETTER_E[7] = {1,0,0,1,1,1,1};   // E = Exit
+// Letter "C" -- briefly shown on the 7-seg when admin mode is entered
+const byte LETTER_C[7] = {1,0,0,1,1,1,0};
 
-enum Mode { MODE_NORMAL, MODE_MENU, MODE_EDIT_CAP };
+enum Mode { MODE_NORMAL, MODE_ADMIN };
 Mode mode = MODE_NORMAL;
-int menuIndex = 0;               // 0=C, 1=r, 2=E
-const int MENU_COUNT = 3;
-int editValue = 0;               // capacity value while editing
-unsigned long lastMenuActivityMs = 0;
+int editValue = 0;                     // capacity value being edited in admin mode
+unsigned long lastAdminActivityMs = 0;
 
 // Events received from the ESP32 encoder bridge, waiting to be consumed
-int  pendingDir = 0;      // -1, 0, +1
-bool pendingBtn = false;
+bool pendingBtn    = false;
+int  pendingCount  = -1;      // -1 = never received; otherwise 0..9 from the Glyph
+bool countUpdated  = false;   // set true whenever on_count writes a fresh value
 
-char lastCardUid[24] = "";  // most recently scanned RFID UID (for reference)
+char lastCardUid[24] = "";    // most recently scanned RFID UID (for reference)
 
 // State machine: what we are currently waiting for
 enum State { IDLE, WAIT_IR2_ENTRY, WAIT_IR1_EXIT };
@@ -140,9 +148,9 @@ void setup() {
   pinMode(BUZZER_PIN, OUTPUT);
   // Bring up the Arduino Bridge so the Python brick can call our RPCs
   Bridge.begin();
-  Bridge.provide("on_encoder", on_encoder);
-  Bridge.provide("on_button",  on_button);
-  Bridge.provide("on_rfid",    on_rfid);
+  Bridge.provide("on_button", on_button);
+  Bridge.provide("on_count",  on_count);
+  Bridge.provide("on_rfid",   on_rfid);
 
   for (int i = 0; i < 7; i++) pinMode(SEG_PINS[i], OUTPUT);
   showDigit(occupancy);
@@ -153,49 +161,37 @@ void setup() {
 }
 
 void loop() {
-  int dir = pollEncoder();     // -1, 0, or +1 per detent
-  bool btn = pollButton();     // true on a fresh press
+  bool btn = pollButton();          // fires once per encoder-button press
+  int  newCount = 0;
+  bool haveNewCount = pollCount(newCount);   // fires once per count change
 
-  // Always run the IR counting so people aren't missed while staff is in the menu
+  // IR counting always runs, regardless of mode
   handleSensors();
 
   switch (mode) {
 
     case MODE_NORMAL:
-      if (btn) enterMenu();
+      // Button press in normal mode -> switch to admin mode
+      if (btn) enterAdmin();
       break;
 
-    case MODE_MENU:
-      if (dir != 0) {
-        menuIndex = (menuIndex + dir + MENU_COUNT) % MENU_COUNT;
-        showMenuItem();
-        lastMenuActivityMs = millis();
-      }
-      if (btn) {
-        chooseMenuItem();
-        lastMenuActivityMs = millis();
-      }
-      if (millis() - lastMenuActivityMs > MENU_TIMEOUT_MS) exitToNormal();
-      break;
-
-    case MODE_EDIT_CAP:
-      if (dir != 0) {
-        editValue = constrain(editValue + dir, MIN_CAPACITY, MAX_CAPACITY);
+    case MODE_ADMIN:
+      // Whenever a fresh count value arrives, treat that number as the
+      // threshold-in-progress and show it on the 7-segment.
+      if (haveNewCount) {
+        editValue = constrain(newCount, MIN_CAPACITY, MAX_CAPACITY);
         showDigit(editValue);
-        Serial.print(F("Capacity -> "));
+        Serial.print(F("[ADMIN] Threshold being set -> "));
         Serial.println(editValue);
-        lastMenuActivityMs = millis();
+        lastAdminActivityMs = millis();
       }
+      // Button press in admin mode -> save threshold and go back to normal
       if (btn) {
-        capacity = editValue;
-        Serial.print(F("Capacity saved: "));
-        Serial.println(capacity);
-        updateAlert(occupancy >= capacity);   // refresh alert with new threshold
-        mode = MODE_MENU;
-        showMenuItem();
-        lastMenuActivityMs = millis();
+        exitAdmin(F("button pressed"));
+      } else if (millis() - lastAdminActivityMs > ADMIN_TIMEOUT_MS) {
+        // Safety net so we don't get stuck if the operator walks away
+        exitAdmin(F("timeout"));
       }
-      if (millis() - lastMenuActivityMs > MENU_TIMEOUT_MS) exitToNormal();
       break;
   }
 }
@@ -244,21 +240,21 @@ void handleSensors() {
 
 // ---- RPC handlers called by the Python brick via Arduino Bridge ----
 // Bridge invokes these from a background thread. We just set flags; the main
-// loop drains them via pollEncoder() / pollButton() as before.
+// loop drains them via pollButton() / pollCount() below.
 // Each handler also prints to Serial so incoming events show up on the
-// Uno Q's Serial Monitor tab alongside the counter output.
-
-void on_encoder(int direction) {
-  int d = (direction > 0) ? +1 : -1;
-  pendingDir = d;
-  Serial.print(F("[link] on_encoder("));
-  Serial.print(d);
-  Serial.println(F(")"));
-}
+// Uno Q's Serial Monitor tab.
 
 void on_button() {
   pendingBtn = true;
   Serial.println(F("[link] on_button()"));
+}
+
+void on_count(int value) {
+  pendingCount = value;
+  countUpdated = true;
+  Serial.print(F("[link] on_count("));
+  Serial.print(value);
+  Serial.println(F(")"));
 }
 
 void on_rfid(String uid) {
@@ -287,13 +283,6 @@ void onCardScanned(const char* uid) {
   digitalWrite(BUZZER_PIN, LOW);
 }
 
-// Returns +1 for one clockwise detent, -1 for counter-clockwise, 0 for nothing.
-int pollEncoder() {
-  int d = pendingDir;
-  pendingDir = 0;
-  return d;
-}
-
 // Returns true once on each fresh press of the encoder button.
 bool pollButton() {
   bool b = pendingBtn;
@@ -301,52 +290,68 @@ bool pollButton() {
   return b;
 }
 
-void enterMenu() {
-  mode = MODE_MENU;
-  menuIndex = 0;
-  lastMenuActivityMs = millis();
-  Serial.println(F("--- MENU ---  turn to scroll, press to select"));
-  showMenuItem();
+// Returns true if a fresh count value has arrived since last call.
+// The value is written to *out*. Otherwise returns false and *out* is untouched.
+bool pollCount(int& out) {
+  if (!countUpdated) return false;
+  out = pendingCount;
+  countUpdated = false;
+  return true;
 }
 
-void showMenuItem() {
-  switch (menuIndex) {
-    case 0: showPattern(LETTER_C); Serial.println(F("> C : Set capacity")); break;
-    case 1: showPattern(LETTER_r); Serial.println(F("> r : Reset counters")); break;
-    case 2: showPattern(LETTER_E); Serial.println(F("> E : Exit menu"));     break;
-  }
+// Enter admin mode. Seed editValue with the Glyph's most recent count (if
+// we've received one) so the display starts at the value the operator sees
+// on the physical knob. Otherwise fall back to the current capacity.
+void enterAdmin() {
+  mode = MODE_ADMIN;
+  int seed = (pendingCount >= 0) ? pendingCount : capacity;
+  editValue = constrain(seed, MIN_CAPACITY, MAX_CAPACITY);
+  lastAdminActivityMs = millis();
+
+  Serial.println();
+  Serial.println(F("=================================="));
+  Serial.println(F("[ADMIN] Entered admin mode."));
+  Serial.print  (F("[ADMIN] Current capacity: "));
+  Serial.println(capacity);
+  Serial.print  (F("[ADMIN] Threshold display starting at: "));
+  Serial.println(editValue);
+  Serial.println(F("[ADMIN] Turn knob to adjust. Press button again to save."));
+  Serial.println(F("=================================="));
+
+  // Brief visual cue: flash "C" for a moment, then show the current value
+  showPattern(LETTER_C);
+  delay(400);
+  showDigit(editValue);
 }
 
-void chooseMenuItem() {
-  switch (menuIndex) {
-    case 0:  // set capacity
-      mode = MODE_EDIT_CAP;
-      editValue = constrain(capacity, MIN_CAPACITY, MAX_CAPACITY);
-      showDigit(editValue);
-      Serial.print(F("Editing capacity. Current: "));
-      Serial.println(editValue);
-      break;
-    case 1:  // reset counters
-      occupancy = 0;
-      totalVisitors = 0;
-      updateAlert(false);
-      Serial.println(F("Counters reset to 0."));
-      exitToNormal();
-      break;
-    case 2:  // exit
-      exitToNormal();
-      break;
-  }
-}
-
-void exitToNormal() {
+// Leave admin mode: commit editValue as the new capacity and restore normal display.
+void exitAdmin(const __FlashStringHelper* reason) {
+  int oldCapacity = capacity;
+  capacity = editValue;
   mode = MODE_NORMAL;
   showDigit(occupancy);
   updateAlert(occupancy >= capacity);
-  Serial.print(F("Back to normal. Capacity="));
-  Serial.print(capacity);
-  Serial.print(F("  Occupancy="));
-  Serial.println(occupancy);
+
+  Serial.println();
+  Serial.println(F("=================================="));
+  Serial.print  (F("[ADMIN] Exiting admin mode ("));
+  Serial.print  (reason);
+  Serial.println(F(")."));
+  if (capacity != oldCapacity) {
+    Serial.print  (F("[ADMIN] Capacity saved: "));
+    Serial.print  (oldCapacity);
+    Serial.print  (F(" -> "));
+    Serial.println(capacity);
+  } else {
+    Serial.print  (F("[ADMIN] Capacity unchanged at "));
+    Serial.println(capacity);
+  }
+  Serial.print  (F("[ADMIN] Occupancy is "));
+  Serial.print  (occupancy);
+  Serial.print  (F(" / "));
+  Serial.println(capacity);
+  Serial.println(F("=================================="));
+  Serial.println();
 }
 
 // Blink the LED, refresh the 7-seg (only in normal mode), and print the current counts
