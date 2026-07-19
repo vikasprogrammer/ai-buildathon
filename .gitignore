@@ -22,5 +22,7 @@ __pycache__/
 .venv/
 venv/
 
-# Camera snapshots (photos of people — not for the repo)
+# Camera runtime data — NEVER commit this.
+# Holds doorway photos, cropped faces, and face embeddings of real
+# people. This repo is public; biometric data does not belong in it.
 camera/data/
