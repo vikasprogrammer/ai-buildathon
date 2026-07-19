@@ -154,10 +154,22 @@ def open_camera(index):
         _cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     except Exception:
         pass
-    # Warm up: the first few frames off a webcam are usually dark or green.
-    for _ in range(5):
-        _cap.read()
-    print(f"camera {index} open")
+    # Warm up until the sensor is actually producing an image, not just for a
+    # fixed count. A C270 measured 0/255 at frame 4 and only reached 96/255 by
+    # frame 14 — a fixed 5-frame warm-up handed the first crossing a black
+    # photo, and a black photo means no face and no match.
+    brightness = 0.0
+    for i in range(40):  # ~2s ceiling; never block startup indefinitely
+        ok, frame = _cap.read()
+        if ok and frame is not None:
+            brightness = float(frame.mean())
+            if brightness > 8:  # out of the black-frame regime
+                print(f"camera {index} open (warm after {i + 1} frames, "
+                      f"brightness {brightness:.0f}/255)")
+                return
+        time.sleep(0.05)
+    print(f"! camera {index} open but still dark after 40 frames "
+          f"(brightness {brightness:.0f}/255) — check the lens cap and lighting")
 
 
 def snap(reason="manual", burst=None):
