@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Claude Code local config (contains conversation state, not for sharing)
+.claude/
+
+# Arduino build artifacts
+build/
+*.hex
+*.elf
+*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
