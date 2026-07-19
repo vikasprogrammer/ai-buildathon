@@ -4,8 +4,8 @@
 #include <WiFiUdp.h>
 
 // ---- WiFi / UDP ----
-const char* WIFI_SSID     = "THE/NUDGE";
-const char* WIFI_PASSWORD = "Admin@123";
+const char* WIFI_SSID     = "test";
+const char* WIFI_PASSWORD = "test1234";
 const int   WIFI_UDP_PORT = 4210;                 // must match Uno Q listener
 IPAddress   broadcastIP(255, 255, 255, 255);       // broadcast to whole subnet
 
