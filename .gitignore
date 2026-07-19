@@ -21,3 +21,6 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+
+# Camera snapshots (photos of people — not for the repo)
+camera/data/
